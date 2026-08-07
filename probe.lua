@@ -1,47 +1,42 @@
 --[[
   kamikaze.lua -- autopilot for a single-use fixed-wing drone
-  Create: Avionics 0.5.2 / Simulated 1.3.0 / Aeronautics 1.3.0 / CC:Tweaked 1.120.0
+  Create: Avionics 0.5.2 / Simulated 1.3.0 / Aeronautics 1.3.0 / CC 1.120.0
 
-  Control goes through peripheral METHODS, not redstone:
-    analog_transmission:setSignal(0..15)          -- throttle
-    gyroscopic_propeller_bearing:setManualTarget  -- thrust vector
-    navigation_table                              -- position, target, bearing
+  USAGE
+    kamikaze test            diagnostics only, no flight, nothing moves
+    kamikaze 1200 70 -430    fly to these world coordinates
+    kamikaze                 fly to the marker in the navigation table
 
-  Target comes from the marker item in the navigation table (placed by hand
-  in-game), or from the TARGET constant below if the table is empty.
-
-  Phases: CLIMB -> CRUISE -> TERMINAL -> STRIKE
+  Coordinates are resolved by the script itself from getProjectedSelfPos,
+  so a lodestone marker is optional.
 ]]
 
 --=============================== CONFIG =====================================
 local CFG = {
-  tickRate        = 0.05,   -- 20 Hz
-  cruiseAlt       = 90,     -- cruise altitude, blocks
-  climbAlt        = 60,     -- below this we climb instead of tracking target
-  terminalRange   = 40,     -- switch to terminal dive at this range
-  fuseRange       = 6,      -- rangefinder sees ground closer than this -> fire
-  fuseDistance    = 8,      -- or distance to target below this -> fire
-  armAltitude     = 15,     -- warhead arms only above this altitude
-  maxThrottle     = 15,
-  cruiseThrottle  = 11,
-  bombSide        = "back", -- computer face wired to the dispensers
-  timeoutSec      = 300,    -- emergency abort
-  -- Altitude PID (drives vertical component of the thrust vector)
+  tickRate       = 0.05,
+  cruiseAlt      = 90,
+  climbAlt       = 60,
+  terminalRange  = 40,
+  fuseRange      = 6,
+  fuseDistance   = 8,
+  armAltitude    = 15,
+  maxThrottle    = 15,
+  cruiseThrottle = 11,
+  bombSide       = "back",
+  timeoutSec     = 300,
+  -- Add this to every heading reading. If the drone circles the target
+  -- instead of closing on it, try 90 / 180 / 270 here. Run "kamikaze test"
+  -- to see raw heading vs computed bearing side by side.
+  headingOffset  = 0,
   altKp = 0.020, altKi = 0.0006, altKd = 0.055,
-  -- Heading PID (horizontal steering of the thrust vector)
   hdgKp = 0.030, hdgKi = 0.0000, hdgKd = 0.040,
 }
-
--- Fallback target if the nav table holds no marker. nil = require a marker.
-local TARGET = nil   -- example: {x = 1200, y = 70, z = -430}
 
 --=============================== HELPERS ====================================
 local function clamp(v, lo, hi)
   if v < lo then return lo elseif v > hi then return hi else return v end
 end
 
--- Avionics peripherals return either a table or several values.
--- Normalise both into a plain array of numbers.
 local function toVec(...)
   local n = select("#", ...)
   if n == 0 then return nil end
@@ -61,19 +56,18 @@ local function call(p, method, ...)
   return table.unpack(r, 2)
 end
 
-local function num(v, fallback)
-  return (type(v) == "number" and v) or fallback
-end
+local function num(v, fb) return (type(v) == "number" and v) or fb end
+
+-- Wrap an angle into -180..180
+local function wrap(a) return ((a + 180) % 360) - 180 end
 
 --=============================== PID ========================================
 local PID = {}
 PID.__index = PID
-
 function PID.new(kp, ki, kd, iLimit)
-  return setmetatable({ kp = kp, ki = ki, kd = kd,
-                        i = 0, prev = nil, iLimit = iLimit or 50 }, PID)
+  return setmetatable({ kp=kp, ki=ki, kd=kd, i=0, prev=nil,
+                        iLimit = iLimit or 50 }, PID)
 end
-
 function PID:step(err, dt)
   self.i = clamp(self.i + err * dt, -self.iLimit, self.iLimit)
   local d = 0
@@ -81,42 +75,21 @@ function PID:step(err, dt)
   self.prev = err
   return self.kp * err + self.ki * self.i + self.kd * d
 end
+function PID:reset() self.i, self.prev = 0, nil end
 
-function PID:reset()
-  self.i, self.prev = 0, nil
-end
-
---=============================== DEVICE DISCOVERY ===========================
-local function findAll()
-  local dev = {
-    nav    = peripheral.find("navigation_table"),
-    gimbal = peripheral.find("gimbal_sensor"),
-    alt    = peripheral.find("altitude_sensor"),
-    vel    = peripheral.find("velocity_sensor"),
-    laser  = peripheral.find("laser_sensor"),
-    optic  = peripheral.find("optical_sensor"),
-    asm    = peripheral.find("physics_assembler"),
-    engine = peripheral.find("portable_engine"),
-    thrust = peripheral.find("gyroscopic_propeller_bearing"),
-  }
-  -- There may be several transmissions; treat them all as one throttle bank.
-  dev.throttles = { peripheral.find("analog_transmission") }
-  return dev
-end
-
-local D = findAll()
-
-local function fail(msg)
-  print("FAULT: " .. msg)
-  error(msg, 0)
-end
-
-if not D.nav then fail("no navigation_table -- nowhere to fly") end
-if #D.throttles == 0 then fail("no analog_transmission -- no throttle") end
-if not D.thrust then
-  print("WARNING: gyroscopic_propeller_bearing not found.")
-  print("Thrust vectoring unavailable, throttle-only flight.")
-end
+--=============================== DEVICES ====================================
+local D = {
+  nav    = peripheral.find("navigation_table"),
+  gimbal = peripheral.find("gimbal_sensor"),
+  alt    = peripheral.find("altitude_sensor"),
+  vel    = peripheral.find("velocity_sensor"),
+  optic  = peripheral.find("optical_sensor"),
+  laser  = peripheral.find("laser_sensor"),
+  asm    = peripheral.find("physics_assembler"),
+  engine = peripheral.find("portable_engine"),
+  thrust = peripheral.find("gyroscopic_propeller_bearing"),
+}
+D.throttles = { peripheral.find("analog_transmission") }
 
 --=============================== ACTUATORS ==================================
 local function setThrottle(level)
@@ -135,46 +108,114 @@ local function releaseThrottle()
   end
 end
 
--- Direction is in the craft's body frame:
--- x = right, y = up, z = forward (nose).
+-- Body frame: x = right, y = up, z = forward (nose)
 local function setThrustVector(x, y, z)
   if not D.thrust then return end
-  local len = math.sqrt(x * x + y * y + z * z)
+  local len = math.sqrt(x*x + y*y + z*z)
   if len < 1e-6 then return end
-  call(D.thrust, "setManualTarget", { x / len, y / len, z / len })
+  call(D.thrust, "setManualTarget", { x/len, y/len, z/len })
 end
 
---=============================== TARGET =====================================
-local function getTarget()
-  if call(D.nav, "hasTarget") then
-    local t = toVec(call(D.nav, "getTargetPosition"))
-    if t and t[1] then return { x = t[1], y = t[2], z = t[3] }, "nav table" end
+--=============================== NAVIGATION =================================
+-- Own position in WORLD coordinates. This is what makes coordinate
+-- targeting possible at all -- the computer lives in a sub-level and
+-- its raw position means nothing outside the contraption.
+local function selfPos()
+  local p = toVec(call(D.nav, "getProjectedSelfPos"))
+  if p and type(p[1]) == "number" then
+    return { x = p[1], y = p[2], z = p[3] }
   end
-  if TARGET then return TARGET, "constant" end
   return nil
 end
 
+local function heading()
+  return num(call(D.nav, "getHeading"), 0) + CFG.headingOffset
+end
+
+-- Minecraft yaw convention: 0 = +Z (south), 90 = -X (west), 180 = -Z (north)
+local function bearingTo(from, to)
+  return math.deg(math.atan2(-(to.x - from.x), to.z - from.z))
+end
+
+local function horizDist(from, to)
+  local dx, dz = to.x - from.x, to.z - from.z
+  return math.sqrt(dx*dx + dz*dz)
+end
+
 --=============================== TELEMETRY ==================================
+local TARGET = nil        -- filled from argv or from the nav table
+
 local function readState()
   local s = {}
-  s.alt      = num(call(D.alt, "getHeight"), 0)
-  s.vspeed   = num(call(D.alt, "getVerticalSpeed"), 0)
-  s.dist     = num(call(D.nav, "getDistanceToTarget"), math.huge)
-  s.relAngle = num(call(D.nav, "getRelativeAngle"), 0)      -- degrees
-  s.vOffset  = num(call(D.nav, "getVerticalOffsetToTarget"), 0)
-  s.closure  = num(call(D.nav, "getClosureRate"), 0)
+  s.alt    = num(call(D.alt, "getHeight"), 0)
+  s.vspeed = num(call(D.alt, "getVerticalSpeed"), 0)
+  s.pos    = selfPos()
+  s.heading = heading()
 
-  local pos = toVec(call(D.nav, "getProjectedSelfPos"))
-  s.pos = pos and { x = pos[1], y = pos[2], z = pos[3] } or nil
+  if TARGET and s.pos then
+    -- Computed by us, no marker required
+    s.dist     = horizDist(s.pos, TARGET)
+    s.bearing  = bearingTo(s.pos, TARGET)
+    s.relAngle = wrap(s.bearing - s.heading)
+    s.vOffset  = TARGET.y - s.pos.y
+  else
+    -- Fall back to the nav table's own readings
+    s.dist     = num(call(D.nav, "getDistanceToTarget"), math.huge)
+    s.relAngle = num(call(D.nav, "getRelativeAngle"), 0)
+    s.vOffset  = num(call(D.nav, "getVerticalOffsetToTarget"), 0)
+    s.bearing  = num(call(D.nav, "getBearing"), 0)
+  end
 
   local ang = toVec(call(D.gimbal, "getAngles"))
   s.pitch = ang and num(ang[1], 0) or 0
   s.roll  = ang and num(ang[3], 0) or 0
 
-  -- Rangefinder: laser first, optical sensor as fallback
   s.range = num(call(D.laser, "getClosestHitDistance"), nil)
              or num(call(D.optic, "getDistance"), math.huge)
   return s
+end
+
+--=============================== TEST MODE ==================================
+local function testMode()
+  print("=== DIAGNOSTICS -- nothing will move ===")
+  print()
+  local names = peripheral.getNames()
+  print("Peripherals attached: " .. #names)
+  for _, n in ipairs(names) do
+    print(string.format("  %-24s %s", n, peripheral.getType(n)))
+  end
+  print()
+
+  local required = {
+    { "navigation_table",             D.nav,           "CRITICAL" },
+    { "analog_transmission",          D.throttles[1],  "CRITICAL" },
+    { "gyroscopic_propeller_bearing", D.thrust,        "CRITICAL" },
+    { "gimbal_sensor",                D.gimbal,        "important" },
+    { "altitude_sensor",              D.alt,           "important" },
+    { "optical_sensor",               D.optic,         "optional" },
+    { "velocity_sensor",              D.vel,           "optional" },
+    { "physics_assembler",            D.asm,           "optional" },
+    { "portable_engine",              D.engine,        "optional" },
+  }
+  for _, r in ipairs(required) do
+    print(string.format("  [%s] %-30s %s",
+          r[2] and "ok" or "--", r[1], r[2] and "" or r[3]))
+  end
+  print()
+
+  local p = selfPos()
+  if p then
+    print(string.format("World position: %.1f %.1f %.1f", p.x, p.y, p.z))
+  else
+    print("World position: UNAVAILABLE (getProjectedSelfPos returned nothing)")
+  end
+  print(string.format("Heading:  %.1f  (offset %d applied)",
+        heading(), CFG.headingOffset))
+  print(string.format("Altitude: %.1f", num(call(D.alt, "getHeight"), -1)))
+  print("Mass:     " .. tostring(call(D.asm, "getMass") or "?"))
+  print()
+  print("Compare 'World position' with F3 in game.")
+  print("If they match, coordinate targeting will work.")
 end
 
 --=============================== WARHEAD ====================================
@@ -190,69 +231,92 @@ local function detonate(reason)
   redstone.setOutput(CFG.bombSide, false)
 end
 
---=============================== MAIN LOOP ==================================
-local altPID = PID.new(CFG.altKp, CFG.altKi, CFG.altKd)
-local hdgPID = PID.new(CFG.hdgKp, CFG.hdgKi, CFG.hdgKd)
+--=============================== ENTRY ======================================
+local argv = { ... }
 
-local target, src = getTarget()
-if not target then
-  fail("no target: put a marker in the navigation table or set TARGET")
+if argv[1] == "test" then
+  testMode()
+  return
 end
 
-print(("Target: %.0f %.0f %.0f  (source: %s)")
-      :format(target.x, target.y, target.z, src))
-print("Craft mass: " .. tostring(call(D.asm, "getMass") or "?"))
+if not D.nav then
+  print("FAULT: no navigation_table")
+  print("Run 'kamikaze test' to see what is attached.")
+  return
+end
+if #D.throttles == 0 then
+  print("FAULT: no analog_transmission -- no throttle")
+  return
+end
+if not D.thrust then
+  print("WARNING: no gyroscopic_propeller_bearing, no steering available")
+end
+
+-- Target: from the command line, else from the nav table marker
+if argv[1] then
+  local x, y, z = tonumber(argv[1]), tonumber(argv[2]), tonumber(argv[3])
+  if not (x and y and z) then
+    print("Usage: kamikaze <x> <y> <z>   |   kamikaze test   |   kamikaze")
+    return
+  end
+  TARGET = { x = x, y = y, z = z }
+  if not selfPos() then
+    print("FAULT: getProjectedSelfPos unavailable, cannot navigate by coords.")
+    print("Use a lodestone compass in the navigation table instead.")
+    return
+  end
+  print(string.format("Target from command line: %.0f %.0f %.0f", x, y, z))
+elseif call(D.nav, "hasTarget") then
+  local t = toVec(call(D.nav, "getTargetPosition"))
+  if t and type(t[1]) == "number" then TARGET = { x=t[1], y=t[2], z=t[3] } end
+  print("Target from navigation table marker")
+else
+  print("FAULT: no target.")
+  print("Either: kamikaze <x> <y> <z>")
+  print("Or:     put a lodestone compass in the navigation table")
+  return
+end
+
+print("Mass: " .. tostring(call(D.asm, "getMass") or "?"))
 print("Launch in 3 s. Ctrl+T to abort.")
 sleep(3)
 
 redstone.setOutput(CFG.bombSide, false)
 
-local phase   = "CLIMB"
-local started = os.clock()
-local last    = os.clock()
+local altPID = PID.new(CFG.altKp, CFG.altKi, CFG.altKd)
+local hdgPID = PID.new(CFG.hdgKp, CFG.hdgKi, CFG.hdgKd)
+local phase, started, last = "CLIMB", os.clock(), os.clock()
 
 while true do
   local now = os.clock()
-  local dt  = math.max(now - last, 0.001)
+  local dt = math.max(now - last, 0.001)
   last = now
 
   local s = readState()
 
-  -- Arm only after reaching a safe altitude.
-  -- Until armed, detonation cannot happen under any condition.
   if not armed and s.alt > CFG.armAltitude then
     armed = true
-    print("ARMED at altitude " .. math.floor(s.alt))
+    print("ARMED at " .. math.floor(s.alt))
   end
 
-  ---------------------------------------------------------------- phases ---
   if phase == "CLIMB" and s.alt >= CFG.climbAlt then
     phase = "CRUISE"; altPID:reset(); print("-> CRUISE")
   elseif phase == "CRUISE" and s.dist <= CFG.terminalRange then
     phase = "TERMINAL"; altPID:reset(); print("-> TERMINAL")
   end
 
-  ----------------------------------------------------- vector + throttle ---
-  local throttle, ty, tz, tx = 0, 0, 1, 0
+  local throttle, tx, ty, tz = 0, 0, 0, 1
 
   if phase == "CLIMB" then
-    -- Gain altitude: thrust up and forward, ignore heading for now
     throttle = CFG.maxThrottle
     ty, tz = 0.7, 0.7
-
   elseif phase == "CRUISE" then
-    -- Hold cruise altitude and steer onto the target
-    local altErr = CFG.cruiseAlt - s.alt
-    ty = clamp(altPID:step(altErr, dt), -0.6, 0.6)
-    local hdgErr = ((s.relAngle + 180) % 360) - 180   -- wrap to -180..180
-    tx = clamp(hdgPID:step(hdgErr, dt), -0.8, 0.8)
+    ty = clamp(altPID:step(CFG.cruiseAlt - s.alt, dt), -0.6, 0.6)
+    tx = clamp(hdgPID:step(s.relAngle, dt), -0.8, 0.8)
     tz = 1.0
     throttle = CFG.cruiseThrottle
-
-  elseif phase == "TERMINAL" then
-    -- Dive: aim precisely, vertical component from height offset to target
-    local hdgErr = ((s.relAngle + 180) % 360) - 180
-    tx = clamp(hdgErr / 45, -1, 1)
+  else
+    tx = clamp(s.relAngle / 45, -1, 1)
     ty = clamp(s.vOffset / math.max(s.dist, 1), -1, 1)
     tz = 1.0
     throttle = CFG.maxThrottle
@@ -261,29 +325,26 @@ while true do
   setThrustVector(tx, ty, tz)
   throttle = setThrottle(throttle)
 
-  ------------------------------------------------------------------ fuse ---
   if armed and phase == "TERMINAL" then
     if s.range <= CFG.fuseRange then
-      detonate(("rangefinder %.1f"):format(s.range)); break
+      detonate(string.format("rangefinder %.1f", s.range)); break
     elseif s.dist <= CFG.fuseDistance then
-      detonate(("target distance %.1f"):format(s.dist)); break
+      detonate(string.format("target distance %.1f", s.dist)); break
     end
   end
 
-  --------------------------------------------------------------- aborts ----
   if now - started > CFG.timeoutSec then
-    print("Timeout. Throttle to zero, strike cancelled.")
+    print("Timeout. Strike cancelled.")
     releaseThrottle(); setThrustVector(0, 1, 0); break
   end
   if D.engine and call(D.engine, "isLit") == false then
-    print("Engine out -- no fuel left.")
+    print("Engine out.")
     releaseThrottle(); break
   end
 
-  ------------------------------------------------------------ telemetry ----
-  term.setCursorPos(1, 10)
-  print(("%-9s H=%-6.1f D=%-7.1f dH=%-6.1f roll=%-5.1f thr=%d  ")
-        :format(phase, s.alt, s.dist, s.vOffset, s.roll, throttle))
+  term.setCursorPos(1, 12)
+  print(string.format("%-9s H=%-6.1f D=%-7.1f rel=%-6.1f dH=%-6.1f thr=%d  ",
+        phase, s.alt, s.dist, s.relAngle, s.vOffset, throttle))
 
   sleep(CFG.tickRate)
 end
