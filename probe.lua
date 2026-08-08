@@ -385,7 +385,7 @@ local function preflight()
   local g = gyro and gyro.getGravity() or {0,0,0}
   local gm = math.sqrt((g[1] or 0)^2 + (g[2] or 0)^2 + (g[3] or 0)^2)
   chk(gm > 0.5, ("gyro reads gravity (%.2f)"):format(gm))
-  pcall(motor.setGeneratedSpeed, 256)
+  pcall(motor.setGeneratedSpeed, -30)
   allProps("assemble")
   applyRotors(80, 0, 0); sleep(2.5)
   local spun = 0
@@ -420,7 +420,7 @@ local function controlLoop()
 
     if state == "ARM" then
       cfg.ground_y = est.y; saveCfg()
-      pcall(motor.setGeneratedSpeed, 256)    -- constant source; RSCs do the mixing
+      pcall(motor.setGeneratedSpeed, -30)    -- constant source; RSCs do the mixing
       allProps("assemble")
       ui_msg = "rotors assembled. Click the Physics Assembler!"
       if not pa or pa.isAssembled() then state = "CAL" end
@@ -491,7 +491,7 @@ local function controlLoop()
         rotorsOff(); pcall(motor.setGeneratedSpeed, 0)
         tiltNeutral(); alt_I = 0; alt_target = nil
         att_I.x, att_I.z = 0, 0
-        if nextGoal() then pcall(motor.setGeneratedSpeed, 256)
+        if nextGoal() then pcall(motor.setGeneratedSpeed, -30)
         else state = "IDLE"; ui_msg = "landed" end
       end
     end
