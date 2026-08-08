@@ -21,7 +21,7 @@ local cfg = {
   alt_ceiling = 30, -- max height above launch point, blocks
   s_prime  = nil,   -- bearing sign                 (auto-calibrated)
   h_sign   = nil,   -- body frame handedness        (auto-calibrated)
-  motor_direction = -1, -- Creative Motor + RSC direction: -1 = reverse, +1 = forward
+  motor_direction = -1, -- unified rotation direction: -1 = reverse, +1 = forward
   att_map  = nil,   -- rotor -> tilt response map   (auto-calibrated)
   ground_y = nil,   -- launch altitude, captured on arming
   max_tilt = 0.20,  -- horizontal thrust component (prop cone ~12 deg => max 0.21)
@@ -45,9 +45,10 @@ if fs.exists(CFG_FILE) then
   if ok and type(t) == "table" then for k, v in pairs(t) do cfg[k] = v end end
 end
 
--- Motor direction migration/validation.
--- The old rsc_sign is intentionally not used anymore: Creative Motor and
--- every RSC must receive the SAME signed direction.
+-- ---------------- DIRECTION MIGRATION ----------------
+-- Older versions stored the RSC direction separately. That could make the
+-- Creative Motor and RSCs fight each other. From v4 onward one sign controls
+-- the complete drivetrain. For this aircraft the required direction is -1.
 if cfg.motor_direction ~= -1 and cfg.motor_direction ~= 1 then
   cfg.motor_direction = -1
 end
@@ -115,72 +116,54 @@ local function tiltNeutral()
 end
 
 -- ---------------- MOTOR / RSC CONTROL ----------------
--- IMPORTANT:
--- Creative Motor is the power source for the drivetrain.
--- RSCs regulate the final rotor RPM.
+-- Creative Motor is the source of rotation. RSCs are the speed controllers.
+-- They must always use the SAME direction sign.
 --
--- Both MUST use the same SIGN.
--- For this drone the required direction is -1:
---
---   Creative Motor = negative source speed
---   RSC             = negative target speed
---   propeller       = positive UP thrust after blade calibration
---
--- The previous version mixed a negative Creative Motor with positive RSC
--- targets. That makes the speed controller fight the source direction and
--- is the reason the lift can appear briefly and then die out.
---
--- The PID is allowed to change MAGNITUDE only. It never changes direction.
+-- Important: do not derive the Creative Motor speed from PID corrections.
+-- The source stays at a small, fixed speed (-30 by default), while the RSCs
+-- request the actual rotor RPM. This matches the original working architecture
+-- and changes only the direction handling.
 
-local MOTOR_SOURCE_RPM = 256
+local MOTOR_SOURCE_RPM = 30
 
-local function signedRPM(magnitude)
-  local m = clamp(math.abs(magnitude or 0), 0, 256)
-  if m < 0.5 then return 0 end
-  return (cfg.motor_direction or -1) * m
+local function motorSetMagnitude(magnitude)
+  local dir = (cfg.motor_direction or -1) < 0 and -1 or 1
+  local mag = clamp(math.abs(magnitude or 0), 0, 256)
+  if mag < 0.5 then
+    pcall(motor.setGeneratedSpeed, 0)
+  else
+    pcall(motor.setGeneratedSpeed, dir * math.floor(mag + 0.5))
+  end
 end
 
-local function motorOn()
-  -- Give the drivetrain a stable source speed. The RSCs then regulate
-  -- their own requested signed RPM below this source.
-  pcall(motor.setGeneratedSpeed, signedRPM(MOTOR_SOURCE_RPM))
+local function motorStart()
+  motorSetMagnitude(MOTOR_SOURCE_RPM)
 end
 
-local function motorOff()
-  motorOff()
+local function motorStop()
+  -- Direct peripheral call; this function never calls itself.
+  pcall(motor.setGeneratedSpeed, 0)
 end
 
--- Per-rotor RPM:
--- collective altitude command + differential attitude correction + mapping pulse.
+-- per-rotor RPM: collective (altitude) + differential (attitude) + mapping pulse
 local function applyRotors(base, cx, cz)
   local dir = (cfg.motor_direction or -1) < 0 and -1 or 1
 
   for _, r in ipairs(rscs) do
     local nm = peripheral.getName(r)
     local d = cfg.att_map and cfg.att_map[nm]
+    local corr = d and (cx * d.x + cz * d.z) or 0
+    if r == pulse_rsc then corr = corr + pulse_amt end
 
-    local corr = 0
-    if d then
-      corr = cx * d.x + cz * d.z
-    end
-
-    if r == pulse_rsc then
-      corr = corr + pulse_amt
-    end
-
-    -- Calculate magnitude first, then apply ONE global direction.
-    -- Never let a PID correction flip an individual rotor through zero.
+    -- PID only changes magnitude. The sign is applied exactly once here.
     local magnitude = clamp(base + corr, 0, 256)
-    local rpm = dir * magnitude
-
-    pcall(r.setTargetSpeed, math.floor(rpm + (rpm >= 0 and 0.5 or -0.5)))
+    local target = dir * math.floor(magnitude + 0.5)
+    pcall(r.setTargetSpeed, target)
   end
 
-  -- The source motor must be alive whenever the rotor controllers are active.
-  -- It is deliberately NOT set to the current collective RPM: the RSCs are
-  -- the final speed regulators.
+  -- Keep the source alive whenever rotor control requests non-zero RPM.
   if base > 0.5 or math.abs(cx) > 0.5 or math.abs(cz) > 0.5 or pulse_amt > 0 then
-    motorOn()
+    motorStart()
   end
 end
 
@@ -188,7 +171,7 @@ local function rotorsOff()
   for _, r in ipairs(rscs) do
     pcall(r.setTargetSpeed, 0)
   end
-  motorOff()
+  motorStop()
 end
 
 -- ---------------- SENSORS / NAVIGATION ----------------
@@ -455,7 +438,7 @@ local function preflight()
   local g = gyro and gyro.getGravity() or {0,0,0}
   local gm = math.sqrt((g[1] or 0)^2 + (g[2] or 0)^2 + (g[3] or 0)^2)
   chk(gm > 0.5, ("gyro reads gravity (%.2f)"):format(gm))
-  motorOn()
+  motorStart()
   allProps("assemble")
   applyRotors(80, 0, 0); sleep(2.5)
   local spun = 0
@@ -463,12 +446,12 @@ local function preflight()
     local okc, s = pcall(p.getRotationSpeed)
     if okc and math.abs(s or 0) > 5 then spun = spun + 1 end
   end
-  chk(spun == 4, "rotors spinning from drivetrain: " .. spun .. "/4 (source=" .. tostring(motor.getGeneratedSpeed and motor.getGeneratedSpeed() or "?") .. ")")
+  chk(spun == 4, "rotors spinning from drivetrain: " .. spun .. "/4")
   local bl_ok, th = calibrateBlades()
   chk(bl_ok, ("all rotors thrust UP [%s]"):format(table.concat({
     ("%.1f"):format(th[1] or 0), ("%.1f"):format(th[2] or 0),
     ("%.1f"):format(th[3] or 0), ("%.1f"):format(th[4] or 0)}, " ")))
-  rotorsOff(); motorOff()
+  rotorsOff()
   term.setCursorPos(1, 6)
   for _, l in ipairs(lines) do print(l) end
   ui_msg = "pre-flight check finished"
@@ -490,7 +473,7 @@ local function controlLoop()
 
     if state == "ARM" then
       cfg.ground_y = est.y; saveCfg()
-      motorOn()    -- constant source; RSCs do the mixing
+      motorStart()    -- constant source; RSCs do the mixing
       allProps("assemble")
       ui_msg = "rotors assembled. Click the Physics Assembler!"
       if not pa or pa.isAssembled() then state = "CAL" end
@@ -558,10 +541,10 @@ local function controlLoop()
       alt_target = (alt_target or est.y) - cfg.land_rate * DT
       updateRotors()
       if est.vy > -0.08 and (alt_target < est.y - 3) then
-        rotorsOff(); motorOff()
+        rotorsOff()
         tiltNeutral(); alt_I = 0; alt_target = nil
         att_I.x, att_I.z = 0, 0
-        if nextGoal() then motorOn()
+        if nextGoal() then motorStart()
         else state = "IDLE"; ui_msg = "landed" end
       end
     end
@@ -664,7 +647,7 @@ local function uiLoop()
         goal = nil; wps = {}; tiltNeutral(); state = "LAND"
       else ui_msg = "not flying" end
     elseif c == "stop" then
-      rotorsOff(); motorOff()
+      rotorsOff()
       tiltNeutral(); alt_target = nil; goal = nil; wps = {}
       state = "IDLE"; ui_msg = "stopped"
     elseif c == "set" and #a == 3 then
@@ -685,7 +668,7 @@ local function uiLoop()
       else ui_msg = "test only on the ground (stop first)" end
     elseif c == "disasm" then
       if state == "IDLE" then
-        rotorsOff(); motorOff()
+        rotorsOff()
         allProps("disassemble"); ui_msg = "rotors disassembled"
       else ui_msg = "only on the ground (stop first)" end
     elseif c == "recal" then
