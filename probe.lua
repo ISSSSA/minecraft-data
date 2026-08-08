@@ -21,7 +21,9 @@ local cfg = {
   alt_ceiling = 30, -- max height above launch point, blocks
   s_prime  = nil,   -- bearing sign                 (auto-calibrated)
   h_sign   = nil,   -- body frame handedness        (auto-calibrated)
-  rsc_sign = 1,     -- rotor spin sign (blade pitch handles thrust dir; manual override only)
+  -- Creative Motor is the ONLY source of rotation direction.
+  -- -1 = reverse, +1 = forward.
+  motor_direction = -1,
   att_map  = nil,   -- rotor -> tilt response map   (auto-calibrated)
   ground_y = nil,   -- launch altitude, captured on arming
   max_tilt = 0.20,  -- horizontal thrust component (prop cone ~12 deg => max 0.21)
@@ -44,6 +46,14 @@ if fs.exists(CFG_FILE) then
   local ok, t = pcall(textutils.unserialize, f.readAll()); f.close()
   if ok and type(t) == "table" then for k, v in pairs(t) do cfg[k] = v end end
 end
+
+-- Migration from older versions.
+-- The old rsc_sign parameter is intentionally ignored.
+-- Direction now belongs exclusively to the Creative Motor.
+if cfg.motor_direction ~= -1 and cfg.motor_direction ~= 1 then
+  cfg.motor_direction = -1
+end
+cfg.rsc_sign = nil
 
 -- ---------------- PERIPHERALS ----------------
 local props = { peripheral.find("gyroscopic_propeller_bearing") }
@@ -106,19 +116,67 @@ local function tiltNeutral()
   allProps("clearManualTarget"); cur_bx, cur_bz = 0, 0
 end
 
--- per-rotor RPM: collective (altitude) + differential (attitude) + mapping pulse
+-- ---------------- MOTOR / RSC CONTROL ----------------
+-- Creative Motor = rotation direction + drivetrain power.
+-- RSC = speed magnitude only.
+-- Propeller thrust direction is handled separately by blade handedness.
+--
+-- This prevents PID corrections from ever reversing the motor.
+
+local function motorMagnitude(v)
+  return clamp(math.abs(v or 0), 0, 256)
+end
+
+local function setMotorPower(magnitude)
+  magnitude = motorMagnitude(magnitude)
+
+  if magnitude < 0.5 then
+    setMotorPower(0)
+  else
+    local dir = (cfg.motor_direction or -1) < 0 and -1 or 1
+    pcall(motor.setGeneratedSpeed, dir * magnitude)
+  end
+end
+
+-- Per-rotor RPM:
+-- collective altitude power + differential attitude correction + calibration pulse.
 local function applyRotors(base, cx, cz)
+  local maxRequested = 0
+
   for _, r in ipairs(rscs) do
     local nm = peripheral.getName(r)
     local d = cfg.att_map and cfg.att_map[nm]
-    local corr = d and (cx * d.x + cz * d.z) or 0
-    if r == pulse_rsc then corr = corr + pulse_amt end
+
+    local corr = 0
+    if d then
+      corr = cx * d.x + cz * d.z
+    end
+
+    if r == pulse_rsc then
+      corr = corr + pulse_amt
+    end
+
+    -- RSC speed is ALWAYS a positive magnitude.
+    -- PID can reduce a rotor to zero, but cannot reverse it.
     local rpm = clamp(base + corr, 0, 256)
-    pcall(r.setTargetSpeed, math.floor((cfg.rsc_sign or 1) * rpm + 0.5))
+
+    if rpm > maxRequested then
+      maxRequested = rpm
+    end
+
+    pcall(r.setTargetSpeed, math.floor(rpm + 0.5))
   end
+
+  -- Keep the Creative Motor in one fixed direction.
+  -- Its power follows the largest requested rotor speed.
+  setMotorPower(maxRequested)
 end
+
 local function rotorsOff()
-  for _, r in ipairs(rscs) do pcall(r.setTargetSpeed, 0) end
+  for _, r in ipairs(rscs) do
+    pcall(r.setTargetSpeed, 0)
+  end
+  setMotorPower(0)
 end
 
 -- ---------------- SENSORS / NAVIGATION ----------------
@@ -385,7 +443,7 @@ local function preflight()
   local g = gyro and gyro.getGravity() or {0,0,0}
   local gm = math.sqrt((g[1] or 0)^2 + (g[2] or 0)^2 + (g[3] or 0)^2)
   chk(gm > 0.5, ("gyro reads gravity (%.2f)"):format(gm))
-  pcall(motor.setGeneratedSpeed, -30)
+  setMotorPower(30)
   allProps("assemble")
   applyRotors(80, 0, 0); sleep(2.5)
   local spun = 0
@@ -398,7 +456,7 @@ local function preflight()
   chk(bl_ok, ("all rotors thrust UP [%s]"):format(table.concat({
     ("%.1f"):format(th[1] or 0), ("%.1f"):format(th[2] or 0),
     ("%.1f"):format(th[3] or 0), ("%.1f"):format(th[4] or 0)}, " ")))
-  rotorsOff(); pcall(motor.setGeneratedSpeed, 0)
+  rotorsOff(); setMotorPower(0)
   term.setCursorPos(1, 6)
   for _, l in ipairs(lines) do print(l) end
   ui_msg = "pre-flight check finished"
@@ -420,7 +478,7 @@ local function controlLoop()
 
     if state == "ARM" then
       cfg.ground_y = est.y; saveCfg()
-      pcall(motor.setGeneratedSpeed, -30)    -- constant source; RSCs do the mixing
+      setMotorPower(30)    -- constant source; RSCs do the mixing
       allProps("assemble")
       ui_msg = "rotors assembled. Click the Physics Assembler!"
       if not pa or pa.isAssembled() then state = "CAL" end
@@ -488,10 +546,10 @@ local function controlLoop()
       alt_target = (alt_target or est.y) - cfg.land_rate * DT
       updateRotors()
       if est.vy > -0.08 and (alt_target < est.y - 3) then
-        rotorsOff(); pcall(motor.setGeneratedSpeed, 0)
+        rotorsOff(); setMotorPower(0)
         tiltNeutral(); alt_I = 0; alt_target = nil
         att_I.x, att_I.z = 0, 0
-        if nextGoal() then pcall(motor.setGeneratedSpeed, -30)
+        if nextGoal() then setMotorPower(30)
         else state = "IDLE"; ui_msg = "landed" end
       end
     end
@@ -594,7 +652,7 @@ local function uiLoop()
         goal = nil; wps = {}; tiltNeutral(); state = "LAND"
       else ui_msg = "not flying" end
     elseif c == "stop" then
-      rotorsOff(); pcall(motor.setGeneratedSpeed, 0)
+      rotorsOff(); setMotorPower(0)
       tiltNeutral(); alt_target = nil; goal = nil; wps = {}
       state = "IDLE"; ui_msg = "stopped"
     elseif c == "set" and #a == 3 then
@@ -602,8 +660,9 @@ local function uiLoop()
                or "bad key/value (see cfg)"
     elseif c == "cfg" then
       term.setCursorPos(1, 6)
-      print(("alt_ceiling=%d  v_max=%.1f  max_tilt=%.2f  pulse=%d"):format(
-        cfg.alt_ceiling, cfg.v_max, cfg.max_tilt, cfg.pulse))
+      print(("alt_ceiling=%d  v_max=%.1f  max_tilt=%.2f  pulse=%d  motor_dir=%d"):format(
+        cfg.alt_ceiling, cfg.v_max, cfg.max_tilt, cfg.pulse,
+        cfg.motor_direction or -1))
       print(("a_brake=%.1f arrive_r=%.1f clearance=%d land_rate=%.1f")
         :format(cfg.a_brake, cfg.arrive_r, cfg.clearance, cfg.land_rate))
       print(("alt kp=%.1f ki=%.1f kd=%.1f | att kp=%.0f ki=%.0f kd=%.0f")
@@ -615,7 +674,7 @@ local function uiLoop()
       else ui_msg = "test only on the ground (stop first)" end
     elseif c == "disasm" then
       if state == "IDLE" then
-        rotorsOff(); pcall(motor.setGeneratedSpeed, 0)
+        rotorsOff(); setMotorPower(0)
         allProps("disassemble"); ui_msg = "rotors disassembled"
       else ui_msg = "only on the ground (stop first)" end
     elseif c == "recal" then
