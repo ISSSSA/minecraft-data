@@ -21,7 +21,7 @@ local cfg = {
   alt_ceiling = 30, -- max height above launch point, blocks
   s_prime  = nil,   -- bearing sign                 (auto-calibrated)
   h_sign   = nil,   -- body frame handedness        (auto-calibrated)
-  rsc_sign = nil,   -- rotor spin sign for upthrust (auto-calibrated)
+  rsc_sign = 1,     -- rotor spin sign (blade pitch handles thrust dir; manual override only)
   att_map  = nil,   -- rotor -> tilt response map   (auto-calibrated)
   ground_y = nil,   -- launch altitude, captured on arming
   max_tilt = 0.20,  -- horizontal thrust component (prop cone ~12 deg => max 0.21)
@@ -220,39 +220,48 @@ local function flyToward(tx, tz, speed_cap)
 end
 
 -- ---------------- CALIBRATION ----------------
--- 1) ground: normalize blade pitch so every rotor thrusts UP
-local function calibrateBlades()
-  ui_msg = "CAL: blade pitch..."
-  applyRotors(90, 0, 0); sleep(2.0)
-  local flipped, bad = 0, 0
-  for _, p in ipairs(props) do
+-- 1) ground: normalize blade pitch so EVERY rotor thrusts UP.
+--    Works for any spin direction/gearbox parity: reads the signed
+--    getThrust() of each bearing and flips its blade pitch if negative.
+local function readThrusts()
+  local t = {}
+  for i, p in ipairs(props) do
     local okc, th = pcall(p.getThrust)
-    if okc and th and th < -0.01 then
-      local h = p.getThrustHandedness()
-      p.setThrustHandedness(h == "right_handed" and "left_handed" or "right_handed")
-      flipped = flipped + 1
-    elseif not okc or not th or math.abs(th) < 0.01 then
-      bad = bad + 1
-    end
+    t[i] = (okc and th) or 0
   end
-  sleep(0.8)
-  return bad == 0, flipped
+  return t
 end
 
--- 2) ground->air: does collective actually lift? if not, flip global spin
-local function calibrateLift()
-  ui_msg = "CAL: lift test..."
-  for _, sgn in ipairs({ cfg.rsc_sign or 1, -(cfg.rsc_sign or 1) }) do
-    cfg.rsc_sign = sgn
-    calibrateBlades()                       -- re-check pitch for this spin dir
-    local h0 = alt.getHeight()
-    applyRotors(180, 0, 0); sleep(2.5)
-    if alt.getHeight() - h0 > 0.5 then
-      applyRotors(70, 0, 0); saveCfg(); return true
+local function calibrateBlades()
+  ui_msg = "CAL: spooling rotors..."
+  applyRotors(100, 0, 0); sleep(2.5)
+  local th = readThrusts()
+  local flipped = 0
+  for i, p in ipairs(props) do
+    if th[i] < -0.01 then
+      local h = p.getThrustHandedness()
+      pcall(p.setThrustHandedness,
+            h == "right_handed" and "left_handed" or "right_handed")
+      flipped = flipped + 1
     end
-    rotorsOff(); sleep(1.5)
   end
-  return false
+  if flipped > 0 then sleep(1.5); th = readThrusts() end
+  local bad = 0
+  for i = 1, #th do if th[i] <= 0.01 then bad = bad + 1 end end
+  ui_msg = ("blades: [%s] flipped=%d"):format(
+    table.concat({("%.1f"):format(th[1] or 0), ("%.1f"):format(th[2] or 0),
+                  ("%.1f"):format(th[3] or 0), ("%.1f"):format(th[4] or 0)}, " "), flipped)
+  return bad == 0, th
+end
+
+-- 2) ground->air: collective climb check (signs are already normalized per prop)
+local function liftCheck()
+  ui_msg = "CAL: lift check..."
+  local h0 = alt.getHeight()
+  applyRotors(190, 0, 0); sleep(3.0)
+  local dh = alt.getHeight() - h0
+  applyRotors(80, 0, 0)
+  return dh > 0.5, dh
 end
 
 -- 3) airborne: learn which RSC drives which corner by pulsing each rotor
@@ -346,14 +355,53 @@ local function calibrateFrame()
 end
 
 -- ---------------- MAIN LOOP ----------------
+local tilt_since = nil
 local function safetyOK()
   local tx, tz = gravityTilt()
   local tilt = math.deg(math.asin(clamp(math.sqrt(tx*tx + tz*tz), 0, 1)))
   if tilt > 40 then
     tiltNeutral(); ui_msg = ("TILT %.0f deg! recovering..."):format(tilt)
+    tilt_since = tilt_since or os.clock()
+    if os.clock() - tilt_since > 4 then      -- cannot recover: emergency landing
+      goal = nil; wps = {}; state = "LAND"
+      ui_msg = "unrecoverable tilt - emergency landing"
+    end
     return false
   end
+  tilt_since = nil
   return true
+end
+
+-- ground pre-flight diagnostic (command: test)
+local function preflight()
+  local lines = {}
+  local function chk(okc, msg) lines[#lines+1] = (okc and "PASS " or "FAIL ") .. msg end
+  chk(#props == 4, "propellers on network: " .. #props .. "/4")
+  chk(#rscs == 4, "speed controllers: " .. #rscs .. "/4")
+  chk(motor ~= nil, "creative motor")
+  chk(nav ~= nil and alt ~= nil and gyro ~= nil, "nav table + altimeter + gyro")
+  chk(pa ~= nil, "physics assembler on network")
+  chk(nav and nav.hasTarget() or false, "compass in nav table")
+  local g = gyro and gyro.getGravity() or {0,0,0}
+  local gm = math.sqrt((g[1] or 0)^2 + (g[2] or 0)^2 + (g[3] or 0)^2)
+  chk(gm > 0.5, ("gyro reads gravity (%.2f)"):format(gm))
+  pcall(motor.setGeneratedSpeed, 256)
+  allProps("assemble")
+  applyRotors(80, 0, 0); sleep(2.5)
+  local spun = 0
+  for _, p in ipairs(props) do
+    local okc, s = pcall(p.getRotationSpeed)
+    if okc and math.abs(s or 0) > 5 then spun = spun + 1 end
+  end
+  chk(spun == 4, "rotors spinning from drivetrain: " .. spun .. "/4")
+  local bl_ok, th = calibrateBlades()
+  chk(bl_ok, ("all rotors thrust UP [%s]"):format(table.concat({
+    ("%.1f"):format(th[1] or 0), ("%.1f"):format(th[2] or 0),
+    ("%.1f"):format(th[3] or 0), ("%.1f"):format(th[4] or 0)}, " ")))
+  rotorsOff(); pcall(motor.setGeneratedSpeed, 0)
+  term.setCursorPos(1, 6)
+  for _, l in ipairs(lines) do print(l) end
+  ui_msg = "pre-flight check finished"
 end
 
 local function nextGoal()
@@ -380,9 +428,17 @@ local function controlLoop()
     elseif state == "CAL" then
       if not est.ok then
         ui_msg = "no target in nav table! Insert a lodestone compass."
-      elseif not cfg.rsc_sign and not calibrateLift() then
-        ui_msg = "cannot lift - check rotors"; rotorsOff(); state = "IDLE"
       else
+        local blades_ok = calibrateBlades()
+        local lifts, dh = false, 0
+        if blades_ok then lifts, dh = liftCheck() end
+        if not blades_ok then
+          ui_msg = "some rotors give no thrust - check sails/assembly (st)"
+          rotorsOff(); state = "IDLE"
+        elseif not lifts then
+          ui_msg = ("thrust too low (dh=%.1f) - check sails or reduce weight"):format(dh)
+          rotorsOff(); state = "IDLE"
+        else
         alt_target = math.min(est.y + 6, ceilingY())
         att_I.x, att_I.z = 0, 0
         if not cfg.att_map  then calibrateRotorMap() end
@@ -391,6 +447,7 @@ local function controlLoop()
         ui_msg = cfg.att_map and "calibration done (attitude trim ON)"
                               or "calibration done (no rotor map!)"
         state = goal and "TAKEOFF" or "HOVER"
+        end
       end
       updateRotors()
 
@@ -451,6 +508,9 @@ Commands:
  fly <x> <y> <z>     fly to point and land
  wp <x> <y> <z>      queue waypoint (wp clear / wp list)
  go [land]           fly the waypoint queue
+ arm                 spin up + calibrate + hover
+ test                ground pre-flight diagnostic
+ disasm              fold rotors (on the ground)
  home / hover / land / stop
  set <key> <value>   change config (set alt_ceiling 60, set att.kp 400)
  cfg                 show config    recal: reset calibration
@@ -522,10 +582,17 @@ local function uiLoop()
     elseif c == "home" then
       wps = {}
       startMission(cfg.anchor.x, cfg.anchor.y + cfg.clearance, cfg.anchor.z, false)
+    elseif c == "arm" then
+      goal = nil; wps = {}
+      if state == "IDLE" then state = "ARM"; ui_msg = "arming..." end
     elseif c == "hover" then
-      goal = nil; wps = {}; tiltNeutral(); alt_target = est.y; state = "HOVER"
+      goal = nil; wps = {}; tiltNeutral()
+      if state == "IDLE" then state = "ARM"; ui_msg = "arming, will hover"
+      else alt_target = est.y; state = "HOVER" end
     elseif c == "land" then
-      goal = nil; wps = {}; tiltNeutral(); state = "LAND"
+      if state ~= "IDLE" then
+        goal = nil; wps = {}; tiltNeutral(); state = "LAND"
+      else ui_msg = "not flying" end
     elseif c == "stop" then
       rotorsOff(); pcall(motor.setGeneratedSpeed, 0)
       tiltNeutral(); alt_target = nil; goal = nil; wps = {}
@@ -543,16 +610,26 @@ local function uiLoop()
         :format(cfg.alt.kp, cfg.alt.ki, cfg.alt.kd, cfg.att.kp, cfg.att.ki, cfg.att.kd))
     elseif c == "trim" then
       ui_msg = ("trim I=(%.1f, %.1f) rpm - imbalance compensation"):format(att_I.x, att_I.z)
+    elseif c == "test" then
+      if state == "IDLE" then preflight()
+      else ui_msg = "test only on the ground (stop first)" end
+    elseif c == "disasm" then
+      if state == "IDLE" then
+        rotorsOff(); pcall(motor.setGeneratedSpeed, 0)
+        allProps("disassemble"); ui_msg = "rotors disassembled"
+      else ui_msg = "only on the ground (stop first)" end
     elseif c == "recal" then
-      cfg.s_prime, cfg.h_sign, cfg.rsc_sign, cfg.att_map = nil, nil, nil, nil
-      saveCfg(); ui_msg = "calibration reset"
+      cfg.s_prime, cfg.h_sign, cfg.att_map = nil, nil, nil
+      saveCfg(); ui_msg = "calibration reset (blade pitch persists in bearings)"
     elseif c == "st" then
-      local th = {}
+      local th, rpm = {}, {}
       for _, p in ipairs(props) do
         local okc, t = pcall(p.getThrust); th[#th+1] = okc and ("%.1f"):format(t or 0) or "?"
+        local okr, r = pcall(p.getRotationSpeed); rpm[#rpm+1] = okr and ("%.0f"):format(r or 0) or "?"
       end
-      ui_msg = ("thrust[%s] asm=%s v=(%.1f %.1f %.1f)"):format(
-        table.concat(th, " "), tostring(pa and pa.isAssembled()), est.vx, est.vy, est.vz)
+      ui_msg = ("thr[%s] rpm[%s] asm=%s vy=%.1f"):format(
+        table.concat(th, " "), table.concat(rpm, " "),
+        tostring(pa and pa.isAssembled()), est.vy)
     elseif c == "help" or c == "" then
       term.setCursorPos(1, 6); print(HELP)
     else
