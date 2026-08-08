@@ -1,334 +1,354 @@
---[[
-  kamikaze_v2.lua -- autopilot for a single-use fixed-wing drone (bpla_v2.nbt)
-  Create: Avionics 0.5.2 / Simulated 1.3.0 / Aeronautics 1.3.0 / CC 1.120.0
+-- ============================================================
+--  АВТОНОМНЫЙ БПЛА  |  Create Aeronautics + Avionics + CC:Tweaked
+--  Полёт к произвольным координатам без пилота.
+--  Позиционирование: navigation_table + лодстоун-компас (якорь),
+--  высота: altitude_sensor, стабилизация: gimbal_sensor + гиро-пропеллеры.
+--  Сохраните как startup.lua на бортовом компьютере.
+-- ============================================================
 
-  USAGE
-    kamikaze test        diagnostics only, nothing moves
-    kamikaze             fly to the marker in the navigation_table
-
-  TARGET: put a lodestone compass (or a map) into the navigation_table.
-  There is no coordinate mode anymore: getProjectedSelfPos does not exist
-  in the Lua API (verified by decompiling avionics 0.5.2). Guidance runs
-  entirely on the nav table's relative readings -- they are sufficient.
-
-  STARTUP ORDER (strict!):
-    1. Fuel the engine, light it (flint & steel). With no signal the
-       transmission passes rotation fully -- the propeller assembles
-       and spins up by itself.
-    2. Check thrust direction: if it blows the wrong way, change the
-       scroll option (wrench) on the engine or the bearing.
-    3. Right-click the physics_assembler to assemble physics.
-    4. Run "kamikaze test", then "kamikaze".
-
-  TRANSMISSION NOTE (decompiled AnalogTransmission):
-    signal 0  = full rotation passthrough (full throttle)
-    signal 15 = full stop
-    i.e. the semantics are INVERTED. This script accounts for it:
-    setThrottle(15) = full power. We NEVER call releaseSignal(): with no
-    redstone nearby the signal falls to 0 and the prop goes full power.
-    Stop = forced signal 15.
-]]
-
---=============================== CONFIG =====================================
-local CFG = {
-  tickRate       = 0.05,
-  cruiseAlt      = 90,      -- cruise altitude (getHeight)
-  climbAlt       = 60,      -- altitude where climb ends
-  terminalRange  = 40,      -- distance to switch into the dive
-  fuseRange      = 6,       -- detonate on rangefinder (optical_sensor)
-  fuseDistance   = 8,       -- detonate on nav table distance
-  armAltitude    = 15,      -- arm above this altitude
-  maxThrottle    = 15,      -- 15 = full power (mapped to signal 0 inside)
-  cruiseThrottle = 11,
-  bombSide       = "back",  -- redstone to the dispensers (computer faces south)
-  timeoutSec     = 300,
-
-  -- CONTROL SIGNS. The setManualTarget vector is in the contraption's
-  -- LOCAL axes (as built: nose = -Z, bearing faces +Z) and gets clamped
-  -- into a 12 deg cone around the bearing axis. Which way the nose
-  -- actually goes depends on the prop rotation sign, so the signs are
-  -- exposed here:
-  --   circles the target / turns away  -> steerSign = -1
-  --   noses down on climb / pitches up -> pitchSign = 1
-  steerSign = 1,
-  pitchSign = -1,   -- default: tail thrust, pushing tail up = nose down
-
-  altKp = 0.020, altKi = 0.0006, altKd = 0.055,
-  hdgKp = 0.030, hdgKi = 0.0000, hdgKd = 0.040,
+-- ---------------- КОНФИГ ----------------
+local CFG_FILE = "autopilot.cfg"
+local cfg = {
+  anchor   = { x = 0, y = 64, z = 0 }, -- координаты ЛОДСТОУНА (якоря). Задать: anchor <x> <y> <z>
+  s_prime  = nil,   -- знак bearing (автокалибровка)
+  h_sign   = nil,   -- ориентация системы координат корпуса (автокалибровка)
+  motor_sign = nil, -- знак скорости мотора для тяги вверх (автокалибровка)
+  max_tilt = 0.20,  -- гориз. компонент вектора тяги (конус пропеллера ~12° => max 0.21)
+  v_max    = 9,     -- целевая крейсерская скорость, блоков/с
+  arrive_r = 2.5,   -- радиус прибытия, блоки
+  clearance = 8,    -- запас высоты на маршруте
+  alt = { kp = 22, ki = 3.5, kd = 30 },  -- PID высоты -> скорость мотора
+  hor = { kp = 0.30, kd = 0.055 },       -- PD горизонтали -> наклон тяги
 }
-
---=============================== HELPERS ====================================
-local function clamp(v, lo, hi)
-  if v < lo then return lo elseif v > hi then return hi else return v end
+local function saveCfg()
+  local f = fs.open(CFG_FILE, "w"); f.write(textutils.serialize(cfg)); f.close()
+end
+if fs.exists(CFG_FILE) then
+  local f = fs.open(CFG_FILE, "r")
+  local ok, t = pcall(textutils.unserialize, f.readAll()); f.close()
+  if ok and type(t) == "table" then for k, v in pairs(t) do cfg[k] = v end end
 end
 
-local function call(p, method, ...)
-  if not p or type(p[method]) ~= "function" then return nil end
-  local r = { pcall(p[method], ...) }
-  if not r[1] then return nil end
-  return table.unpack(r, 2)
-end
+-- ---------------- ПЕРИФЕРИЯ ----------------
+local props = { peripheral.find("gyroscopic_propeller_bearing") }
+local motor = peripheral.find("Create_CreativeMotor")
+local nav   = peripheral.find("navigation_table")
+local alt   = peripheral.find("altitude_sensor")
+local gyro  = peripheral.find("gimbal_sensor")
+local pa    = peripheral.find("physics_assembler")
 
-local function num(v, fb) return (type(v) == "number" and v) or fb end
-local function wrap(a) return ((a + 180) % 360) - 180 end
-
---=============================== PID ========================================
-local PID = {}
-PID.__index = PID
-function PID.new(kp, ki, kd, iLimit)
-  return setmetatable({ kp=kp, ki=ki, kd=kd, i=0, prev=nil,
-                        iLimit = iLimit or 50 }, PID)
-end
-function PID:step(err, dt)
-  self.i = clamp(self.i + err * dt, -self.iLimit, self.iLimit)
-  local d = 0
-  if self.prev then d = (err - self.prev) / dt end
-  self.prev = err
-  return self.kp * err + self.ki * self.i + self.kd * d
-end
-function PID:reset() self.i, self.prev = 0, nil end
-
---=============================== DEVICES ====================================
-local D = {
-  nav    = peripheral.find("navigation_table"),
-  gimbal = peripheral.find("gimbal_sensor"),
-  alt    = peripheral.find("altitude_sensor"),
-  vel    = peripheral.find("velocity_sensor"),
-  optic  = peripheral.find("optical_sensor"),
-  asm    = peripheral.find("physics_assembler"),
-  engine = peripheral.find("portable_engine"),
-  thrust = peripheral.find("gyroscopic_propeller_bearing"),
-}
-D.throttles = { peripheral.find("analog_transmission") }
-
---=============================== ACTUATORS ==================================
--- level 0..15, where 15 = full power. The transmission receives 15-level.
-local function setThrottle(level)
-  level = math.floor(clamp(level, 0, CFG.maxThrottle) + 0.5)
-  for _, t in ipairs(D.throttles) do
-    call(t, "setSignal", 15 - level)   -- setSignal enables external control itself
-  end
-  return level
-end
-
--- Full drivetrain stop. NEVER releaseSignal: with no redstone that means full power.
-local function stopThrottle()
-  for _, t in ipairs(D.throttles) do
-    call(t, "setSignal", 15)
+local function require_periph(p, n, want)
+  if not p or (want and #p ~= want) then
+    error(("Периферия '%s' не найдена%s. Проверь кабели/модемы."):format(
+      n, want and (" (нужно " .. want .. ", есть " .. (p and #p or 0) .. ")") or ""), 0)
   end
 end
+require_periph(props[1] and props, "gyroscopic_propeller_bearing", nil)
+if #props ~= 4 then error("Найдено пропеллеров: " .. #props .. " из 4. Проверь сеть.", 0) end
+require_periph(motor, "Create_CreativeMotor")
+require_periph(nav, "navigation_table")
+require_periph(alt, "altitude_sensor")
+require_periph(gyro, "gimbal_sensor")
 
--- Contraption local axes: nose = -Z, bearing faces +Z.
--- x = sideways, y = up, z along the bearing axis (base +1).
-local function setThrustVector(x, y, z)
-  if not D.thrust then return end
-  local len = math.sqrt(x*x + y*y + z*z)
-  if len < 1e-6 then return end
-  call(D.thrust, "setManualTarget", { x = x/len, y = y/len, z = z/len })
+-- ---------------- СОСТОЯНИЕ ----------------
+local state = "IDLE"       -- IDLE|ARM|CAL|TAKEOFF|NAV|HOVER|LAND
+local goal = nil           -- {x,y,z, land=bool}
+local est = { x=0, z=0, y=0, vx=0, vz=0, vy=0, ok=false }
+local ui_msg = "введите команду (help)"
+local alt_target, transit_alt = nil, nil
+local alt_I = 0
+local DT = 0.15            -- период контура, с
+local last_h, last_x, last_z = nil, nil, nil
+
+-- ---------------- УТИЛИТЫ ----------------
+local function clamp(v, lo, hi) return math.max(lo, math.min(hi, v)) end
+local function wrap180(a) return (a + 180) % 360 - 180 end
+
+local function allProps(fn, ...)
+  for _, p in ipairs(props) do pcall(p[fn], ...) end
+end
+local function setTilt(bx, bz)              -- вектор тяги в системе корпуса
+  local m = math.sqrt(bx*bx + bz*bz)
+  if m > cfg.max_tilt then bx, bz = bx*cfg.max_tilt/m, bz*cfg.max_tilt/m end
+  for _, p in ipairs(props) do pcall(p.setManualTarget, { bx, 1, bz }) end
+end
+local function tiltNeutral() allProps("clearManualTarget") end -- гиро сам держит "вверх"
+local function setMotor(v)
+  pcall(motor.setGeneratedSpeed, clamp(math.floor(v + 0.5), -256, 256))
 end
 
-local function neutralThrust()
-  if D.thrust then call(D.thrust, "clearManualTarget") end  -- gyro auto-holds against gravity
+-- ---------------- НАВИГАЦИЯ ----------------
+-- Мировая азимут-конвенция: az(dir)=atan2(dx,dz); dir(az)=(sin az, cos az). Градусы.
+local function readSensors()
+  local h = alt.getHeight()
+  est.vy = last_h and (h - last_h) / DT or 0
+  last_h = h
+  est.y = h
+
+  if not nav.hasTarget() then est.ok = false; return end
+  local d3   = nav.getDistanceToTarget()
+  local dyA  = nav.getVerticalOffsetToTarget()          -- anchor.y - self.y
+  local brg  = nav.getBearing()                         -- цель отн. носа, [-180,180]
+  local hdg  = nav.getHeading()                         -- курс носа в мире
+  local dh   = math.sqrt(math.max(d3*d3 - dyA*dyA, 0))
+  local sp, hs = cfg.s_prime or 1, cfg.h_sign or 1
+  -- мировой азимут на якорь: hdg + h*S'*bearing
+  local azA = hdg + hs * sp * brg
+  local sx = cfg.anchor.x - dh * math.sin(math.rad(azA))
+  local sz = cfg.anchor.z - dh * math.cos(math.rad(azA))
+  local vx = last_x and (sx - last_x) / DT or 0
+  local vz = last_z and (sz - last_z) / DT or 0
+  est.vx = est.vx * 0.7 + vx * 0.3                      -- сглаживание
+  est.vz = est.vz * 0.7 + vz * 0.3
+  last_x, last_z = sx, sz
+  est.x, est.z = sx, sz
+  est.hdg, est.brg, est.dh = hdg, brg, dh
+  est.ok = true
 end
 
---=============================== TELEMETRY ==================================
-local function readState()
-  local s = {}
-  s.alt    = num(call(D.alt, "getHeight"), 0)
-  s.vspeed = num(call(D.alt, "getVerticalSpeed"), 0)
-  s.heading = num(call(D.nav, "getHeading"), 0)
+-- направление на мировую точку в системе корпуса
+local function bodyDirTo(wx, wz)
+  local az = math.deg(math.atan2(wx - est.x, wz - est.z))    -- мировой азимут на цель
+  local beta = (cfg.h_sign or 1) * wrap180(az - est.hdg)     -- в корпусе
+  return math.sin(math.rad(beta)), math.cos(math.rad(beta))
+end
 
-  -- all guidance runs on nav table readings (marker required)
-  s.dist     = num(call(D.nav, "getDistanceToTarget"), math.huge)
-  s.relAngle = num(call(D.nav, "getRelativeAngle"), 0)
-  s.vOffset  = num(call(D.nav, "getVerticalOffsetToTarget"), 0)
-  s.closure  = num(call(D.nav, "getClosureRate"), 0)
+-- ---------------- КОНТУР ВЫСОТЫ ----------------
+local function altitudeLoop()
+  if not alt_target then return end
+  local e = alt_target - est.y
+  alt_I = clamp(alt_I + e * cfg.alt.ki * DT, -256, 256)      -- I-часть выучит газ висения
+  local out = alt_I + cfg.alt.kp * e - cfg.alt.kd * est.vy
+  setMotor((cfg.motor_sign or 1) * clamp(out, 0, 256))
+end
 
-  local ang = call(D.gimbal, "getAngles")
-  if type(ang) == "table" then
-    s.pitch = num(ang[1], 0); s.roll = num(ang[3], 0)
-  else
-    s.pitch, s.roll = 0, 0
+-- ---------------- КАЛИБРОВКИ ----------------
+local function calibrateThrust()
+  ui_msg = "CAL: направление тяги..."
+  alt_target = nil
+  for _, sgn in ipairs({ 1, -1 }) do
+    local h0 = alt.getHeight()
+    setMotor(sgn * 160); sleep(2.5)
+    local dh = alt.getHeight() - h0
+    setMotor(sgn * 60)                       -- не глушить: мягко удерживаем
+    if dh > 0.5 then cfg.motor_sign = sgn; saveCfg(); return true end
+    setMotor(0); sleep(1.5)
   end
+  return false
+end
 
-  -- rangefinder: optical returns range+0.5 on a miss, hence hasHit
-  if call(D.optic, "hasHit") then
-    s.range = num(call(D.optic, "getDistance"), math.huge)
-  else
-    s.range = math.huge
+local function calibrateBearing()
+  ui_msg = "CAL: знак пеленга..."
+  for _, sp in ipairs({ 1, -1 }) do
+    cfg.s_prime = sp
+    local d0 = nav.getDistanceToTarget()
+    local t0 = os.clock()
+    while os.clock() - t0 < 4 do             -- наклон строго на якорь
+      readSensors(); altitudeLoop()
+      local b = math.rad(sp * nav.getBearing())
+      setTilt(math.sin(b) * 0.10, math.cos(b) * 0.10)
+      sleep(DT)
+    end
+    tiltNeutral()
+    if nav.getDistanceToTarget() < d0 - 1.0 then saveCfg(); return true end
+    sleep(2)                                  -- погасить скорость
   end
-  return s
+  return false
 end
 
---=============================== TEST MODE ==================================
-local function testMode()
-  print("=== DIAGNOSTICS -- nothing will move ===")
-  print()
-  local names = peripheral.getNames()
-  print("Peripherals on network: " .. #names)
-  for _, n in ipairs(names) do
-    print(string.format("  %-28s %s", n, peripheral.getType(n)))
+local function calibrateFrame()
+  ui_msg = "CAL: ориентация корпуса..."
+  readSensors()
+  -- гипотезы h=±1 дают зеркальные позиции; двигаемся строго "вперёд" (beta=0),
+  -- у верной гипотезы азимут смещения совпадает с курсом
+  local snap = {}
+  for _, hh in ipairs({ 1, -1 }) do
+    cfg.h_sign = hh; readSensors()
+    snap[hh] = { x = est.x, z = est.z }
   end
-  print()
-  local req = {
-    { "navigation_table",             D.nav,          "CRITICAL" },
-    { "analog_transmission",          D.throttles[1], "CRITICAL" },
-    { "gyroscopic_propeller_bearing", D.thrust,       "CRITICAL" },
-    { "altitude_sensor",              D.alt,          "important" },
-    { "gimbal_sensor",                D.gimbal,       "important" },
-    { "optical_sensor",               D.optic,        "important (fuse)" },
-    { "velocity_sensor",              D.vel,          "optional" },
-    { "physics_assembler",            D.asm,          "optional" },
-    { "portable_engine",              D.engine,       "optional" },
-  }
-  for _, r in ipairs(req) do
-    print(string.format("  [%s] %-30s %s", r[2] and "ok" or "--", r[1], r[2] and "" or r[3]))
+  local t0 = os.clock()
+  while os.clock() - t0 < 4 do
+    readSensors(); altitudeLoop()
+    setTilt(0, 0.10)                          -- вперёд по корпусу
+    sleep(DT)
   end
-  print()
-  print("Physics assembled: " .. tostring(call(D.asm, "isAssembled")))
-  print("Mass:              " .. tostring(call(D.asm, "getMass") or "?"))
-  print("Engine lit:        " .. tostring(call(D.engine, "isLit")))
-  print(string.format("Altitude: %.1f  Heading: %.1f",
-        num(call(D.alt,"getHeight"),-1), num(call(D.nav,"getHeading"),0)))
-  print("Bearing tilt:      " .. tostring(call(D.thrust, "getTiltAngle")))
-  print()
-  if call(D.nav, "hasTarget") then
-    print(string.format("Target: yes (%s), dist %.0f, rel angle %.1f, dH %.1f",
-      tostring(call(D.nav,"getTargetType")),
-      num(call(D.nav,"getDistanceToTarget"),-1),
-      num(call(D.nav,"getRelativeAngle"),0),
-      num(call(D.nav,"getVerticalOffsetToTarget"),0)))
-  else
-    print("Target: NONE. Put a lodestone compass into the navigation_table.")
-  end
-  print()
-  print("Thrust check: the transmission spins at signal 0 anyway --")
-  print("watch which way it blows. Wrong way -> wrench the scroll")
-  print("option on the engine or the bearing.")
-end
-
---=============================== WARHEAD ====================================
-local armed = false
-
-local function detonate(reason)
-  print("STRIKE: " .. reason)
-  redstone.setOutput(CFG.bombSide, true)
-  sleep(0.3)
-  stopThrottle()
-  sleep(1.0)
-  redstone.setOutput(CFG.bombSide, false)
-end
-
---=============================== ENTRY ======================================
-local argv = { ... }
-
-if argv[1] == "test" then
-  testMode()
-  return
-end
-
-if argv[1] then
-  print("Coordinate mode is not supported: the nav table has no")
-  print("getProjectedSelfPos in the Lua API. Put a lodestone compass")
-  print("into the navigation_table and just run: kamikaze")
-  return
-end
-
-if not D.nav then
-  print("FAULT: no navigation_table. Run 'kamikaze test'.")
-  return
-end
-if #D.throttles == 0 then
-  print("FAULT: no analog_transmission -- no throttle.")
-  return
-end
-if not D.thrust then
-  print("WARNING: no gyroscopic_propeller_bearing -- no steering.")
-end
-if not call(D.nav, "hasTarget") then
-  print("FAULT: no target. Lodestone compass into the navigation_table.")
-  return
-end
-if call(D.asm, "isAssembled") == false then
-  print("FAULT: physics not assembled. Right-click the physics_assembler.")
-  return
-end
-
-print("Target: " .. tostring(call(D.nav, "getTargetType")))
-print("Mass:   " .. tostring(call(D.asm, "getMass") or "?"))
-print("Launch in 3 s. Ctrl+T to abort.")
-sleep(3)
-
-redstone.setOutput(CFG.bombSide, false)
-
-local altPID = PID.new(CFG.altKp, CFG.altKi, CFG.altKd)
-local hdgPID = PID.new(CFG.hdgKp, CFG.hdgKi, CFG.hdgKd)
-local phase, started, last = "CLIMB", os.clock(), os.clock()
-
-while true do
-  local now = os.clock()
-  local dt = math.max(now - last, 0.001)
-  last = now
-
-  local s = readState()
-
-  if not armed and s.alt > CFG.armAltitude then
-    armed = true
-    print("ARMED at " .. math.floor(s.alt))
-  end
-
-  if phase == "CLIMB" and s.alt >= CFG.climbAlt then
-    phase = "CRUISE"; altPID:reset(); print("-> CRUISE")
-  elseif phase == "CRUISE" and s.dist <= CFG.terminalRange then
-    phase = "TERMINAL"; altPID:reset(); print("-> TERMINAL")
-  end
-
-  local throttle, tx, ty, tz = 0, 0, 0, 1
-
-  if phase == "CLIMB" then
-    throttle = CFG.maxThrottle
-    -- with no override the gyro pulls up by itself (12 deg cone); help a bit
-    tx, ty, tz = 0, -0.4 * CFG.pitchSign, 1.0
-  elseif phase == "CRUISE" then
-    ty = CFG.pitchSign * clamp(altPID:step(CFG.cruiseAlt - s.alt, dt), -0.6, 0.6)
-    tx = CFG.steerSign * clamp(hdgPID:step(s.relAngle, dt), -0.8, 0.8)
-    tz = 1.0
-    throttle = CFG.cruiseThrottle
-  else -- TERMINAL
-    tx = CFG.steerSign * clamp(s.relAngle / 45, -1, 1)
-    ty = CFG.pitchSign * clamp(-s.vOffset / math.max(s.dist, 1), -1, 1)
-    tz = 1.0
-    throttle = CFG.maxThrottle
-  end
-
-  setThrustVector(tx, ty, tz)
-  throttle = setThrottle(throttle)
-
-  if armed and phase == "TERMINAL" then
-    if s.range <= CFG.fuseRange then
-      detonate(string.format("rangefinder %.1f", s.range)); break
-    elseif s.dist <= CFG.fuseDistance then
-      detonate(string.format("target distance %.1f", s.dist)); break
+  tiltNeutral()
+  local best, bestErr = 1, 1e9
+  for _, hh in ipairs({ 1, -1 }) do
+    cfg.h_sign = hh; readSensors()
+    local dx, dz = est.x - snap[hh].x, est.z - snap[hh].z
+    if dx*dx + dz*dz > 0.5 then
+      local azm = math.deg(math.atan2(dx, dz))
+      local err = math.abs(wrap180(azm - est.hdg))
+      if err < bestErr then best, bestErr = hh, err end
     end
   end
-
-  if now - started > CFG.timeoutSec then
-    print("Timeout. Strike cancelled.")
-    stopThrottle(); neutralThrust(); break
-  end
-  if D.engine and call(D.engine, "isLit") == false then
-    print("Engine out.")
-    stopThrottle(); break
-  end
-
-  term.setCursorPos(1, 12)
-  print(string.format("%-9s H=%-6.1f D=%-7.1f rel=%-6.1f dH=%-6.1f clo=%-5.1f thr=%d  ",
-        phase, s.alt, s.dist, s.relAngle, s.vOffset, s.closure, throttle))
-
-  sleep(CFG.tickRate)
+  cfg.h_sign = best; saveCfg()
+  sleep(1.5)
+  return bestErr < 60
 end
 
-stopThrottle()
-print("Program finished.")
+-- ---------------- ГЛАВНЫЙ КОНТУР ----------------
+local function safetyOK()
+  local a = gyro.getAngles()
+  local tilt = math.max(math.abs(a[1] or 0), math.abs(a[2] or 0))
+  if tilt > 40 then
+    tiltNeutral(); ui_msg = ("КРЕН %.0f°! стабилизация..."):format(tilt)
+    return false
+  end
+  return true
+end
+
+local function controlLoop()
+  while true do
+    readSensors()
+
+    if state == "ARM" then
+      allProps("assemble")
+      ui_msg = "роторы собраны. Кликни Physics Assembler для сборки корпуса!"
+      if not pa or pa.isAssembled() then state = "CAL" end
+
+    elseif state == "CAL" then
+      if not est.ok then
+        ui_msg = "нет цели в нав-столе! Положи лодстоун-компас."
+      else
+        if not cfg.motor_sign and not calibrateThrust() then
+          ui_msg = "тяга не поднимает аппарат — проверь роторы"; state = "IDLE"
+        else
+          alt_target = est.y + 6
+          if not cfg.s_prime  then calibrateBearing() end
+          if not cfg.h_sign   then calibrateFrame()   end
+          ui_msg = "калибровка готова"; state = goal and "TAKEOFF" or "HOVER"
+        end
+      end
+
+    elseif state == "TAKEOFF" then
+      transit_alt = math.max(est.y, goal.y) + cfg.clearance
+      alt_target = transit_alt
+      if math.abs(est.y - transit_alt) < 2 then state = "NAV" end
+      altitudeLoop()
+
+    elseif state == "NAV" then
+      altitudeLoop()
+      if not est.ok then
+        tiltNeutral(); ui_msg = "потерян якорь! верни компас в нав-стол"
+      elseif safetyOK() then
+        local dx, dz = goal.x - est.x, goal.z - est.z
+        local dist = math.sqrt(dx*dx + dz*dz)
+        if dist < cfg.arrive_r then
+          tiltNeutral(); alt_target = goal.y
+          state = goal.land and "LAND" or "HOVER"
+          ui_msg = "прибыли: " .. ("%.1f, %.1f"):format(est.x, est.z)
+        else
+          local bx, bz = bodyDirTo(goal.x, goal.z)
+          local v = math.sqrt(est.vx^2 + est.vz^2)
+          local v_des = clamp(dist * 0.5, 0, cfg.v_max)
+          local mag = clamp(cfg.hor.kp * (v_des - v) * 0.1 + dist * 0.01, 0, cfg.max_tilt)
+          -- демпфер: компонент скорости в корпусе
+          local dvx, dvz = bodyDirTo(est.x + est.vx, est.z + est.vz)
+          local vb = v
+          setTilt(bx * mag - dvx * vb * cfg.hor.kd, bz * mag - dvz * vb * cfg.hor.kd)
+          ui_msg = ("NAV: %.0fм v=%.1f h=%.0f"):format(dist, v, est.y)
+        end
+      end
+
+    elseif state == "HOVER" then
+      altitudeLoop()
+      if safetyOK() then
+        -- мягкое удержание точки
+        if goal then
+          local dx, dz = goal.x - est.x, goal.z - est.z
+          local d = math.sqrt(dx*dx + dz*dz)
+          if d > 1 then
+            local bx, bz = bodyDirTo(goal.x, goal.z)
+            setTilt(bx * clamp(d * 0.02, 0, 0.08), bz * clamp(d * 0.02, 0, 0.08))
+          else tiltNeutral() end
+        end
+      end
+
+    elseif state == "LAND" then
+      safetyOK()
+      alt_target = (alt_target or est.y) - 1.6 * DT       -- ~1.6 блока/с вниз
+      altitudeLoop()
+      if est.vy > -0.08 and (alt_target < est.y - 3) then  -- команда вниз есть, а не снижаемся => сели
+        setMotor(0); tiltNeutral(); alt_I = 0; alt_target = nil
+        state = "IDLE"; ui_msg = "посадка выполнена"
+      end
+    end
+
+    sleep(DT)
+  end
+end
+
+-- ---------------- ИНТЕРФЕЙС ----------------
+local HELP = [[
+Команды:
+ anchor <x> <y> <z>  координаты лодстоуна-якоря
+ goto <x> <y> <z>    лететь к точке (виснуть по прибытии)
+ fly <x> <y> <z>     лететь и сесть в точке
+ home                лететь к якорю
+ hover               зависнуть на месте
+ land                посадка здесь
+ stop                мотор 0, всё сбросить
+ recal               сбросить калибровки
+ st                  статус]]
+
+local function startMission(x, y, z, land_flag)
+  goal = { x = x, y = y, z = z, land = land_flag }
+  alt_I = 0
+  if state == "IDLE" then state = "ARM"
+  elseif state == "HOVER" or state == "NAV" or state == "LAND" then state = "TAKEOFF" end
+end
+
+local function uiLoop()
+  term.clear()
+  while true do
+    term.setCursorPos(1, 1); term.clearLine()
+    write(("[%s] %s"):format(state, ui_msg))
+    term.setCursorPos(1, 2); term.clearLine()
+    if est.ok then
+      write(("поз: %.0f %.0f %.0f  якорь:%.0f,%.0f,%.0f"):format(
+        est.x, est.y, est.z, cfg.anchor.x, cfg.anchor.y, cfg.anchor.z))
+    else
+      write("нет позиции: проверь компас в нав-столе")
+    end
+    term.setCursorPos(1, 4); term.clearLine(); write("> ")
+    local line = read()
+    local a = {}
+    for w in line:gmatch("%S+") do a[#a+1] = w end
+    local c = (a[1] or ""):lower()
+    if c == "anchor" and #a == 4 then
+      cfg.anchor = { x = tonumber(a[2]), y = tonumber(a[3]), z = tonumber(a[4]) }
+      saveCfg(); ui_msg = "якорь сохранён"
+    elseif (c == "goto" or c == "fly") and #a == 4 then
+      startMission(tonumber(a[2]), tonumber(a[3]), tonumber(a[4]), c == "fly")
+    elseif c == "home" then
+      startMission(cfg.anchor.x, cfg.anchor.y + cfg.clearance, cfg.anchor.z, false)
+    elseif c == "hover" then
+      goal = nil; tiltNeutral(); alt_target = est.y; state = "HOVER"
+    elseif c == "land" then
+      goal = nil; tiltNeutral(); state = "LAND"
+    elseif c == "stop" then
+      setMotor(0); tiltNeutral(); alt_target = nil; goal = nil; state = "IDLE"
+      ui_msg = "остановлено"
+    elseif c == "recal" then
+      cfg.s_prime, cfg.h_sign, cfg.motor_sign = nil, nil, nil; saveCfg()
+      ui_msg = "калибровки сброшены"
+    elseif c == "st" then
+      ui_msg = ("props=%d asm=%s v=(%.1f %.1f %.1f)"):format(
+        #props, tostring(pa and pa.isAssembled()), est.vx, est.vy, est.vz)
+    elseif c == "help" or c == "" then
+      term.setCursorPos(1, 6); print(HELP)
+    else
+      ui_msg = "не понял. help — список команд"
+    end
+  end
+end
+
+-- ---------------- СТАРТ ----------------
+allProps("setThrustHandedness", "right_handed")  -- одинаковый шаг лопастей на всех
+print("Автопилот запущен. help — команды.")
+parallel.waitForAny(controlLoop, uiLoop)
+
 
 -- wget https://raw.githubusercontent.com/ISSSSA/minecraft-data/main/probe.lua probe
